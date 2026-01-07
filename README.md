@@ -1,5 +1,5 @@
 # Emucoach_Cata_4.3.4_v19_Quest_Editor
-GUI quest editor for Emucoach 4.3.4 Cata v19 **(Still betaish needs more testing and refining)**
+GUI quest editor for Emucoach 4.3.4 Cata v19 **(Still betaish needs more testing and refining) DOES NOT FULLY WORK MORE OF A PREVIEW**
 
 ##Requirements##
 
