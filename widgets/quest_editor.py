@@ -12,6 +12,7 @@ import struct
 from pathlib import Path
 
 from metadata import QUEST_TABS
+from widgets.loot_editor import QuestLootEditor
 
 from PyQt6.QtGui import QKeySequence, QShortcut
 
@@ -67,6 +68,8 @@ def load_skillline_dbc(path: str) -> list[tuple[int, str]]:
 
     return rows
 
+QUEST_ID_MIN = 1000000
+QUEST_ID_MAX = 2000000
 
 
 # Columns that are TEXT in your quest_template schema
@@ -798,9 +801,17 @@ class QuestEditor(QtWidgets.QWidget):
 
         self.tabs = QtWidgets.QTabWidget()
         self._build_tabs()
+
         # Starters / Enders tab (relation tables)
         self.relations = QuestRelationPanel(self.db, self.log, self)
         self.tabs.addTab(self.relations, "Starters / Enders")
+
+        # Quest Loot Conditions tab
+        self.quest_loot = QuestLootEditor(self.db, self.log, self)
+        self.tabs.addTab(self.quest_loot, "Quest Loot Conditions")
+
+        # Auto-load loot editor when its tab is selected
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.btn_new = QtWidgets.QPushButton("New Quest")
         self.btn_delete = QtWidgets.QPushButton("Delete Quest")
@@ -1108,8 +1119,16 @@ class QuestEditor(QtWidgets.QWidget):
 
                 self._widgets[col] = editor
                 
+
                 if col == "entry":
-                    editor.setEnabled(False)
+                    editor.setEnabled(True)
+                    editor.setToolTip("Quest ID (Entry). Edit and press Enter to load.")
+
+                    # Press Enter in the Entry box to load that quest ID
+                    if isinstance(editor, QtWidgets.QLineEdit):
+                        editor.returnPressed.connect(
+                            lambda e=editor: self.load(int(e.text())) if (e.text() or "").strip().isdigit() else None
+                        )
 
                 # -----------------------------
                 # Case B: Bitmask picker fields
@@ -1518,6 +1537,42 @@ class QuestEditor(QtWidgets.QWidget):
         # Small delay so fast typing doesn't hit DB repeatedly
         self._lookup_timer.start(120)
 
+    def _get_required_item_ids(self) -> list[int]:
+        ids: list[int] = []
+        for n in range(1, 7):
+            w = self._widgets.get(f"ReqItemId{n}")
+            if not w:
+                continue
+            try:
+                raw = (w.text() or "").strip()
+                v = int(raw) if raw else 0
+            except Exception:
+                v = 0
+            if v > 0:
+                ids.append(v)
+        return ids
+
+
+    def _hook_required_item_autosync(self) -> None:
+        # connect ReqItemId fields -> debounce -> sync tab
+        for n in range(1, 7):
+            w = self._widgets.get(f"ReqItemId{n}")
+            if not w:
+                continue
+            if hasattr(w, "textChanged"):
+                w.textChanged.connect(lambda _=None: self._loot_sync_timer.start())
+
+
+    def _sync_loot_from_required_items(self) -> None:
+        if not hasattr(self, "quest_loot"):
+            return
+        if getattr(self, "current_id", None) is None:
+            return
+        item_ids = self._get_required_item_ids()
+        # Ensure tab is on the correct quest + sync rows
+        self.quest_loot.load(int(self.current_id))
+        self.quest_loot.sync_from_required_items(item_ids)
+
     def _set_inline_label(self, col: str, text: str) -> None:
         lbl = self._name_labels.get(col)
         if not lbl:
@@ -1639,7 +1694,14 @@ class QuestEditor(QtWidgets.QWidget):
             for c in list(getattr(self, "_name_labels", {}).keys()):
                 self._schedule_lookup(c)
 
-        
+     def _on_tab_changed(self, idx: int) -> None:
+        if self.current_id is None:
+            return
+        if self.tabs.widget(idx) is self.quest_loot:
+            # Ensure loot editor is pointed at the current quest
+            if getattr(self.quest_loot, "quest_id", None) != int(self.current_id):
+                self.quest_loot.load(int(self.current_id))
+   
     def load(self, quest_id: int) -> None:
         row = self.db.fetch_one("SELECT * FROM quest_template WHERE entry = %s", (quest_id,))
         if not row:
@@ -1711,15 +1773,19 @@ class QuestEditor(QtWidgets.QWidget):
         if hasattr(self, "relations"):
             self.relations.load(quest_id)
 
+        # Auto-load + auto-sync quest loot conditions
+        if hasattr(self, "quest_loot"):
+            self.quest_loot.load(quest_id)
+            self.quest_loot.sync_from_required_items(self._get_required_item_ids())
+
         self.log(f"Loaded quest {quest_id}: {row.get('Title','')}")
         self._update_dirty_title()
         # Refresh decoded bitmask labels after loading
         if hasattr(self, "_bitmask_labels"):
             for col in list(self._bitmask_labels.keys()):
                 self._update_bitmask_label(col)
-    
-
-
+  
+        
     def _collect(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {}
 
@@ -1868,7 +1934,24 @@ class QuestEditor(QtWidgets.QWidget):
                     return
 
         try:
-            new_id = self.db.next_quest_id()
+            row = self.db.fetch_one(
+                """
+                SELECT COALESCE(MAX(entry), %s - 1) AS m
+                FROM quest_template
+                WHERE entry BETWEEN %s AND %s
+                """,
+                (QUEST_ID_MIN, QUEST_ID_MIN, QUEST_ID_MAX),
+            )
+
+            new_id = int(row["m"]) + 1
+            if new_id > QUEST_ID_MAX:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Quest ID Range Exhausted",
+                    f"No free quest IDs in range {QUEST_ID_MIN}–{QUEST_ID_MAX}",
+                )
+                return
+
             self.db.create_quest(new_id)
             self.db.commit()
         except Exception as e:
@@ -1890,7 +1973,7 @@ class QuestEditor(QtWidgets.QWidget):
         if self.current_id is None:
             return
         self.load(self.current_id)
-
+      
     def save(self) -> None:
         if self.current_id is None:
             return
