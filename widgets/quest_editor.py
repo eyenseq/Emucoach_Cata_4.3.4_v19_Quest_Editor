@@ -1694,7 +1694,7 @@ class QuestEditor(QtWidgets.QWidget):
             for c in list(getattr(self, "_name_labels", {}).keys()):
                 self._schedule_lookup(c)
 
-     def _on_tab_changed(self, idx: int) -> None:
+    def _on_tab_changed(self, idx: int) -> None:
         if self.current_id is None:
             return
         if self.tabs.widget(idx) is self.quest_loot:
