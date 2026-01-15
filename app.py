@@ -9,7 +9,6 @@ from PyQt6 import QtWidgets, QtGui, QtCore
 from db import DBConfig, Database
 from widgets.search_panel import QuestSearchPanel
 from widgets.quest_editor import QuestEditor
-from widgets.loot_editor import QuestLootEditor
 
 
 APP_TITLE = "EmuCoach Quest Editor (PyQt6)"
@@ -49,12 +48,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.search = QuestSearchPanel(self.db, self.log)
         self.editor = QuestEditor(self.db, self.log)
-        self.loot = QuestLootEditor(self.db, self.log)
-
+        
         # Center: tabs (Quest editor + loot editor)
         center_tabs = QtWidgets.QTabWidget()
         center_tabs.addTab(self.editor, "Quest")
-        center_tabs.addTab(self.loot, "Quest Loot (conditions)")
         center_tabs.setDocumentMode(True)
 
         # Split main area: left search / center tabs
@@ -134,9 +131,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_quest(self, quest_id: int) -> None:
         self.editor.load(quest_id)
-        self.loot.load(quest_id)
-
-
+        
 def main() -> None:
     app = QtWidgets.QApplication([])
     apply_dark_theme(app)

@@ -14,11 +14,28 @@ class DBConfig:
     database: str
     charset: str = "utf8mb4"
 
+_LOOT_TABLE_BY_SOURCE = {
+    1:  "creature_loot_template",
+    2:  "disenchant_loot_template",
+    3:  "fishing_loot_template",
+    4:  "gameobject_loot_template",
+    5:  "item_loot_template",
+    6:  "mail_loot_template",
+    7:  "milling_loot_template",
+    8:  "pickpocketing_loot_template",
+    9:  "prospecting_loot_template",
+    10: "reference_loot_template",
+    11: "skinning_loot_template",
+    12: "spell_loot_template",
+}
 
 class Database:
     def __init__(self, cfg: DBConfig):
         self.cfg = cfg
         self._conn: Optional[pymysql.connections.Connection] = None
+        
+        # expose module mapping as an instance attribute (used by preview/delete)
+        self._LOOT_TABLE_BY_SOURCE = _LOOT_TABLE_BY_SOURCE
 
     def connect(self) -> None:
         if self._conn:
@@ -67,22 +84,145 @@ class Database:
             (entry, 2, 1, 1, 1),
         )
 
-    def delete_quest(self, entry: int) -> None:
-        # Order matters due to foreign references
-        self.execute("DELETE FROM creature_quest_starter WHERE quest = %s", (entry,))
-        self.execute("DELETE FROM creature_quest_ender WHERE quest = %s", (entry,))
-        self.execute("DELETE FROM gameobject_questrelation WHERE quest = %s", (entry,))
-        self.execute("DELETE FROM gameobject_involvedrelation WHERE quest = %s", (entry,))
+    def preview_delete_quest(self, quest_id: int) -> dict:
+        quest_id = int(quest_id)
 
-        # Remove quest-related loot conditions
-        # SourceType 19 = Quest
-        self.execute(
-            "DELETE FROM conditions WHERE SourceTypeOrReferenceId = 19 AND SourceEntry = %s",
-            (entry,),
+        # Quest-linked condition types where ConditionValue1 = quest_id
+        # NOTE: Do NOT include "2" (ITEM) here. It's not a quest id link.
+        quest_ctypes = (8, 9, 14, 28, 43)
+
+        ph_ct = ",".join(["%s"] * len(quest_ctypes))
+
+        keys = self.fetch_all(
+            f"""
+            SELECT DISTINCT SourceTypeOrReferenceId, SourceGroup, SourceEntry, SourceId
+            FROM conditions
+            WHERE ConditionTypeOrReference IN ({ph_ct})
+              AND ConditionValue1 = %s
+            """,
+            tuple(quest_ctypes) + (quest_id,),
         )
 
-        # Finally delete the quest itself
-        self.execute("DELETE FROM quest_template WHERE entry = %s", (entry,))
+        result = {
+            "quest_id": quest_id,
+            "anchor_groups": len(keys),
+            "conditions_rows": 0,
+            "loot_rows_by_table": {},
+        }
+
+        if not keys:
+            return result
+
+        placeholders = ",".join(["(%s,%s,%s,%s)"] * len(keys))
+        params = []
+        for k in keys:
+            params.extend([
+                int(k["SourceTypeOrReferenceId"]),
+                int(k["SourceGroup"]),
+                int(k["SourceEntry"]),
+                int(k["SourceId"]),
+            ])
+
+        row = self.fetch_one(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM conditions
+            WHERE (SourceTypeOrReferenceId, SourceGroup, SourceEntry, SourceId)
+                  IN ({placeholders})
+            """,
+            tuple(params),
+        )
+        result["conditions_rows"] = int(row["n"])
+
+        by_table = {}
+        for k in keys:
+            table = self._LOOT_TABLE_BY_SOURCE.get(int(k["SourceTypeOrReferenceId"]))
+            if table and int(k["SourceGroup"]) > 0 and int(k["SourceEntry"]) > 0:
+                by_table.setdefault(table, set()).add(
+                    (int(k["SourceGroup"]), int(k["SourceEntry"]))
+                )
+
+        for table, pairs in by_table.items():
+            ph = ",".join(["(%s,%s)"] * len(pairs))
+            p = []
+            for e, i in pairs:
+                p.extend([e, i])
+
+            r = self.fetch_one(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE (entry,item) IN ({ph})",
+                tuple(p),
+            )
+            result["loot_rows_by_table"][table] = int(r["n"])
+
+        return result
+
+
+    def delete_quest(self, quest_id: int) -> None:
+        quest_id = int(quest_id)
+
+        # Quest-linked condition types where ConditionValue1 = quest_id
+        quest_ctypes = (8, 9, 14, 28, 43, 47)
+        ph_ct = ",".join(["%s"] * len(quest_ctypes))
+
+        keys = self.fetch_all(
+            f"""
+            SELECT DISTINCT SourceTypeOrReferenceId, SourceGroup, SourceEntry, SourceId
+            FROM conditions
+            WHERE ConditionTypeOrReference IN ({ph_ct})
+              AND ConditionValue1 = %s
+            """,
+            tuple(quest_ctypes) + (quest_id,),
+        )
+
+        if keys:
+            placeholders = ",".join(["(%s,%s,%s,%s)"] * len(keys))
+            params = []
+            for k in keys:
+                params.extend([
+                    int(k["SourceTypeOrReferenceId"]),
+                    int(k["SourceGroup"]),
+                    int(k["SourceEntry"]),
+                    int(k["SourceId"]),
+                ])
+
+            # Delete ALL conditions for those groups (not just the anchor row)
+            self.execute(
+                f"""
+                DELETE FROM conditions
+                WHERE (SourceTypeOrReferenceId, SourceGroup, SourceEntry, SourceId)
+                      IN ({placeholders})
+                """,
+                tuple(params),
+            )
+
+            # Delete matching loot rows per SourceType
+            by_table = {}
+            for k in keys:
+                table = self._LOOT_TABLE_BY_SOURCE.get(int(k["SourceTypeOrReferenceId"]))
+                if table and int(k["SourceGroup"]) > 0 and int(k["SourceEntry"]) > 0:
+                    by_table.setdefault(table, set()).add(
+                        (int(k["SourceGroup"]), int(k["SourceEntry"]))
+                    )
+
+            for table, pairs in by_table.items():
+                ph = ",".join(["(%s,%s)"] * len(pairs))
+                p = []
+                for e, i in pairs:
+                    p.extend([e, i])
+
+                self.execute(
+                    f"DELETE FROM {table} WHERE (entry,item) IN ({ph})",
+                    tuple(p),
+                )
+
+        # Quest relations
+        self.execute("DELETE FROM creature_quest_starter WHERE quest=%s", (quest_id,))
+        self.execute("DELETE FROM creature_quest_ender WHERE quest=%s", (quest_id,))
+        self.execute("DELETE FROM gameobject_questrelation WHERE quest=%s", (quest_id,))
+        self.execute("DELETE FROM gameobject_involvedrelation WHERE quest=%s", (quest_id,))
+
+        # IMPORTANT: your schema uses quest_template.entry (not Id)
+        self.execute("DELETE FROM quest_template WHERE entry=%s", (quest_id,))
 
     def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[Dict[str, Any]]:
         rows = self.fetch_all(sql, params)
