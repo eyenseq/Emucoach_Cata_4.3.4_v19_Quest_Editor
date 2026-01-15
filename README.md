@@ -3,6 +3,13 @@
 This project is a desktop editor for a TrinityCore-style 4.3.4 (Cataclysm) database.  
 It includes a quest editor and a **generic loot editor** that can edit multiple `*_loot_template` tables, plus quest-linked `conditions`.
 
+## Notes for Testers
+- This release focuses on **structural correctness and safety**, not polish.
+- Conditions table is **MyISAM**: deletes are best-effort and not transactional.
+- Please report:
+  - Any missing loot deletions
+  - Condition types that behave unexpectedly
+  - UI layout issues at different resolutions
 ---
 
 ## What you need (first-time setup)
