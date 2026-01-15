@@ -129,8 +129,7 @@ TAB_GROUPS = {
 BITMASK_FIELDS = {
     # Quest core
     "QuestFlags": "quest_flags",
-    "SpecialFlags": "special_flags",
-
+    
     # Masks
     "RequiredRaces": "race_mask",
     
@@ -140,59 +139,56 @@ BITMASK_FIELDS = {
 # NOTE: Flag meanings vary slightly by core; treat this as a starter and adjust to match your server.
 BITMASK_OPTIONS = {
     "quest_flags": [
-    (0x00000001, "Stay Alive"),
-    (0x00000002, "Party Accept"),
-    (0x00000004, "Exploration"),                 # <-- FIXED (was missing)
-    (0x00000008, "Sharable"),
-    (0x00000010, "Has Condition"),               # <-- FIXED (was mislabeled as Exploration)
-    (0x00000020, "Hide Reward POI"),
-    (0x00000040, "Raid"),
-    (0x00000080, "TBC Only"),
-    (0x00000100, "No Money From XP"),
-    (0x00000200, "Hidden Rewards"),
-    (0x00000400, "Tracking"),
-    (0x00000800, "Deprecate Reputation"),
-    (0x00001000, "Daily"),
-    (0x00002000, "PvP"),
-    (0x00004000, "Unavailable"),                 # <-- FIXED (was mislabeled Repeatable)
-    (0x00008000, "Weekly"),
-    (0x00010000, "Auto Complete"),
-    (0x00020000, "Display Item In Tracker"),
-    (0x00040000, "Objective Text as Complete"),  # <-- THIS is your missing 262144 bit
-    (0x00080000, "Auto Accept"),
+        (0x00000001, "Stay Alive"),
+        (0x00000002, "Party Accept"),
+        (0x00000004, "Exploration"),
+        (0x00000008, "Sharable"),
+        (0x00000010, "Has Condition"),
+        (0x00000020, "Hide Reward POI"),
+        (0x00000040, "Raid"),
+        (0x00000080, "TBC"),
+        (0x00000100, "No Money at Max Level"),
+        (0x00000200, "Hidden Rewards"),
+        (0x00000400, "Tracking"),
+        (0x00000800, "Deprecated Reputation"),
+        (0x00001000, "Daily"),
+        (0x00002000, "PvP"),
+        (0x00004000, "Unavailable"),
+        (0x00008000, "Weekly"),
+        (0x00010000, "Auto Complete"),
+        (0x00020000, "Display Item in Tracker"),
+        (0x00040000, "Objective Text"),
+        (0x00080000, "Auto Accept"),
     ],
-    "special_flags": [
-        (0x01, "Repeatable (Special)"),
-        (0x02, "Auto Accept"),
-        (0x04, "Auto Complete"),
-    ],
-    "class_mask": [
-        (0x0001, "Warrior"),
-        (0x0002, "Paladin"),
-        (0x0004, "Hunter"),
-        (0x0008, "Rogue"),
-        (0x0010, "Priest"),
-        (0x0020, "Death Knight"),
-        (0x0040, "Shaman"),
-        (0x0080, "Mage"),
-        (0x0100, "Warlock"),
-        (0x0400, "Druid"),
-    ],
+
     "race_mask": [
-        (0x00000001, "Human"),
-        (0x00000002, "Orc"),
-        (0x00000004, "Dwarf"),
-        (0x00000008, "Night Elf"),
-        (0x00000010, "Undead"),
-        (0x00000020, "Tauren"),
-        (0x00000040, "Gnome"),
-        (0x00000080, "Troll"),
-        (0x00000100, "Goblin"),
-        (0x00000200, "Blood Elf"),
-        (0x00000400, "Draenei"),
-        (0x00200000, "Worgen"),
+        (1, "Human"),
+        (2, "Orc"),
+        (4, "Dwarf"),
+        (8, "Night Elf"),
+        (16, "Undead"),
+        (32, "Tauren"),
+        (64, "Gnome"),
+        (128, "Troll"),
+        (256, "Goblin"),
+        (512, "Blood Elf"),
+        (1024, "Draenei"),
+        (2097152, "Worgen"),
     ],
-    
+
+    # Used by SkillOrClassMask when in "Class Mask" mode
+    "class_mask": [
+        (1, "Warrior"),
+        (2, "Paladin"),
+        (4, "Hunter"),
+        (8, "Rogue"),
+        (16, "Priest"),
+        (32, "Death Knight"),
+        (64, "Shaman"),
+        (128, "Mage"),
+        (256, "Warlock"),
+        (1024, "Druid"),
+    ],
 }
 
 CLASS_ID_NAMES = {
@@ -218,15 +214,16 @@ ENUM_FIELDS = {
 
 ENUM_OPTIONS = {
     "quest_method": [
-        ("0", "0 — Auto/Default"),
-        ("1", "1 — Normal"),
-        ("2", "2 — Always available (Trinity common default)"),
+        ("0", "0 — Enabled, auto-completed"),
+        ("1", "1 — Disabled (not yet implemented in core)"),
+        ("2", "2 — Enabled (does not auto-complete)"),
+        ("3", "3 — World Quest"),
     ],
 
     # ✅ Trinity-style quest_template.Type values (common set)
     "quest_type": [
         ("0",  "0 — Normal"),
-        ("1",  "1 — Elite"),
+        ("1",  "1 — Group"),
         ("21", "21 — Life"),
         ("41", "41 — PvP"),
         ("62", "62 — Raid"),
@@ -234,6 +231,9 @@ ENUM_OPTIONS = {
         ("82", "82 — World Event"),
         ("83", "83 — Legendary"),
         ("84", "84 — Escort"),
+        ("85", "85 — Heroic"),
+        ("88", "88 — Raid (10)"),
+        ("89", "89 — Raid (25)"),
     ],
 }
 
@@ -463,12 +463,21 @@ class BitmaskPickerDialog(QtWidgets.QDialog):
 
         self.btn_all = QtWidgets.QPushButton("All")
         self.btn_none = QtWidgets.QPushButton("None")
+
+        # Faction quick buttons (only shown for race picker)
+        self.btn_alliance = QtWidgets.QPushButton("Alliance")
+        self.btn_horde = QtWidgets.QPushButton("Horde")
+        self.btn_alliance.setVisible(False)
+        self.btn_horde.setVisible(False)
+
         self.btn_ok = QtWidgets.QPushButton("OK")
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
 
         btns = QtWidgets.QHBoxLayout()
         btns.addWidget(self.btn_all)
         btns.addWidget(self.btn_none)
+        btns.addWidget(self.btn_alliance)
+        btns.addWidget(self.btn_horde)
         btns.addStretch(1)
         btns.addWidget(self.btn_cancel)
         btns.addWidget(self.btn_ok)
@@ -482,6 +491,17 @@ class BitmaskPickerDialog(QtWidgets.QDialog):
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_all.clicked.connect(self._check_all)
         self.btn_none.clicked.connect(self._check_none)
+
+        # Show + wire Alliance/Horde only for race-style lists
+        opt_names = " ".join([name.lower() for _bit, name in self._options])
+        is_race_picker = ("human" in opt_names and "orc" in opt_names and "undead" in opt_names)
+
+        if is_race_picker:
+            self.btn_alliance.setVisible(True)
+            self.btn_horde.setVisible(True)
+            self.btn_alliance.clicked.connect(lambda: self._set_race_faction("alliance"))
+            self.btn_horde.clicked.connect(lambda: self._set_race_faction("horde"))
+
         self.search.textChanged.connect(self._apply_filter)
 
     def value(self) -> int:
@@ -498,6 +518,17 @@ class BitmaskPickerDialog(QtWidgets.QDialog):
     def _check_none(self):
         for _bit, cb in self._checks:
             cb.setChecked(False)
+    
+    def _set_race_faction(self, which: str) -> None:
+        alliance = {"human", "dwarf", "night elf", "gnome", "draenei", "worgen"}
+        horde = {"orc", "undead", "tauren", "troll", "blood elf", "goblin"}
+
+        for _bit, cb in self._checks:
+            txt = cb.text().lower()
+            if which == "alliance":
+                cb.setChecked(any(n in txt for n in alliance))
+            else:
+                cb.setChecked(any(n in txt for n in horde))
 
     def _apply_filter(self, text: str):
         t = (text or "").strip().lower()
@@ -778,8 +809,11 @@ class QuestEditor(QtWidgets.QWidget):
         self._widgets: Dict[str, QtWidgets.QWidget] = {}
         self._soc_mode: Dict[str, QtWidgets.QComboBox] = {}
         self._soc_hint: Dict[str, QtWidgets.QLabel] = {}
+        self._soc_refresh: Dict[str, Callable[[], None]] = {}
         self._zos_mode: Dict[str, QtWidgets.QComboBox] = {}
         self._zos_hint: Dict[str, QtWidgets.QLabel] = {}
+        self._zos_refresh: Dict[str, Callable[[], None]] = {}   # ✅ add this
+
         self._ftypes: Dict[str, str] = {}  # col -> ftype from metadata
 
         # Inline lookup labels: col -> QLabel
@@ -792,7 +826,9 @@ class QuestEditor(QtWidgets.QWidget):
         self._bitmask_labels: Dict[str, QtWidgets.QLabel] = {}
         self._areatable_cache: List[Tuple[int, str]] = []
         self._areatable_name_by_id: Dict[int, str] = {}
-        
+        self._questsort_cache: List[Tuple[int, str]] = []
+        self._questsort_name_by_id: Dict[int, str] = {}
+
         # Debounce lookups so typing doesn't spam DB
         self._lookup_timer = QTimer(self)
         self._lookup_timer.setSingleShot(True)
@@ -904,7 +940,7 @@ class QuestEditor(QtWidgets.QWidget):
                     hint.setStyleSheet("color: #A9B1BA;")
                     hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-                    def refresh_hint():
+                    def refresh_hint(mode=mode, val_edit=val_edit, hint=hint):
                         txt = (val_edit.text() or "").strip()
                         try:
                             n = int(txt) if txt else 0
@@ -917,30 +953,42 @@ class QuestEditor(QtWidgets.QWidget):
                             return
 
                         if mode.currentText() == "Class Mask":
-                            # n is a bitmask (positive). Show decoded classes.
                             names = []
                             for bit, cname in BITMASK_OPTIONS.get("class_mask", []):
                                 if n & bit:
                                     names.append(cname)
-                            hint.setText(", ".join(names) if names else f"Mask {n}")
+
+                            if names:
+                                hint.setText(f"{', '.join(names)}   (mask={n}, 0x{n:X})")
+                            else:
+                                hint.setText(f"(none)   (mask={n}, 0x{n:X})")
                         else:
-                            # SkillLine id
-                            # If you have a cache dict {id:name}, use it; otherwise show generic.
+                            self._ensure_skillline_cache_loaded()
                             nm = getattr(self, "_skillline_name_by_id", {}).get(n, "")
                             hint.setText(f"{n} — {nm}" if nm else f"SkillLine {n}")
 
                     mode.currentIndexChanged.connect(lambda _i, rh=refresh_hint: (rh(), self._update_dirty_title()))
                     val_edit.textEdited.connect(lambda _t, rh=refresh_hint: (rh(), self._update_dirty_title()))
+                    # allow load() to refresh decode after setting values
+                    self._soc_refresh[col] = refresh_hint
+
+                    # initialize hint immediately
+                    refresh_hint()
 
 
                     btn_pick = QtWidgets.QPushButton("Pick…")
                     btn_pick.setFixedWidth(70)
 
-                    def do_pick(mode=mode, val_edit=val_edit):
+                    def do_pick(_checked: bool = False, mode=mode, val_edit=val_edit):
+                        # _checked comes from QPushButton.clicked(bool) — ignore it
                         if mode.currentText() == "Class Mask":
-                            # Re-use existing bitmask picker for classes
-                            # We temporarily treat SkillOrClassMask as a class_mask picker
-                            chosen = self._open_bitmask_picker_value("class_mask", current=int(val_edit.text() or "0"))
+                            cur = 0
+                            try:
+                                cur = int((val_edit.text() or "0").strip() or "0")
+                            except Exception:
+                                cur = 0
+
+                            chosen = self._open_bitmask_picker_value("class_mask", current=cur)
                             if chosen is None:
                                 return
                             val_edit.setText(str(chosen))
@@ -980,11 +1028,8 @@ class QuestEditor(QtWidgets.QWidget):
                     h.setSpacing(8)
 
                     mode = QtWidgets.QComboBox()
-                    # IMPORTANT: set item data so currentData() works
-                    mode.clear()
                     mode.addItem("Zone", "zone")
                     mode.addItem("Sort", "sort")
-                    mode.setCurrentIndex(0)  # default to Zone
                     mode.setFixedWidth(90)
 
                     val_edit = QtWidgets.QLineEdit()
@@ -998,88 +1043,81 @@ class QuestEditor(QtWidgets.QWidget):
                     hint.setStyleSheet("color: #A9B1BA;")
                     hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-                    def refresh_hint(mode=mode, val_edit=val_edit, hint=hint, btn_pick=btn_pick):
-                        is_zone = (mode.currentData() == "zone")
-                        # Zone mode uses picker; Sort mode is manual (or prompt)
-                        btn_pick.setEnabled(True)
-
-                        txt = (val_edit.text() or "").strip()
-                        if not txt:
-                            hint.setText("—")
-                            return
-
-                        # allow name typing when Zone
-                        try:
-                            n = int(txt)
-                        except Exception:
-                            hint.setText(f"Search: {txt}" if is_zone else "—")
-                            return
-
-                        if is_zone:
-                            nm = getattr(self, "_areatable_name_by_id", {}).get(n, "")
-                            hint.setText(f"{n} — {nm}" if nm else f"AreaTable {n}")
-                        else:
-                            hint.setText(f"Sort {abs(n)}")
-
-                    def zos_do_pick(_checked: bool = False, mode=mode, val_edit=val_edit):
-                        try:
-                            is_zone = (mode.currentData() == "zone")  # or use mode.currentText() == "Zone" if you prefer
-
-                            # Prefill search if user typed text (non-numeric)
-                            q = (val_edit.text() or "").strip()
-                            initial = ""
-                            if q:
-                                try:
-                                    int(q)
-                                except Exception:
-                                    initial = q
-
-                            self._load_areatable_dbc()
-                            if not getattr(self, "_areatable_cache", None):
-                                QtWidgets.QMessageBox.warning(self, "Zone picker", "AreaTable cache is empty.")
-                                return
-
-                            dlg = SimplePickerDialog(
-                                title="Pick Zone (AreaTable)",
-                                rows=self._areatable_cache,   # [(id, name), ...] built from col1/col12 in your loader
-                                parent=self,
-                                initial_query=initial,
-                            )
-                            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                                zid = dlg.chosen_id()
-                                if zid is None:
-                                    return
-
-                                # Zone => +id, Sort => -id
-                                v = abs(int(zid))
-                                val_edit.setText(str(v if is_zone else -v))
-
-                                refresh_hint()
-                                self._update_dirty_title()
-
-                        except Exception as e:
-                            QtWidgets.QMessageBox.critical(self, "Zone picker error", f"{type(e).__name__}: {e}")
-
-
-                    btn_pick.clicked.connect(zos_do_pick)
-                    mode.currentIndexChanged.connect(lambda _i, rh=refresh_hint: (rh(), self._update_dirty_title()))
-                    val_edit.textEdited.connect(lambda _t, rh=refresh_hint: (rh(), self._update_dirty_title()))
-
-
+                    # ✅ ADD widgets to the row layout
                     h.addWidget(mode, 0)
                     h.addWidget(val_edit, 0)
                     h.addWidget(btn_pick, 0)
                     h.addWidget(hint, 1)
 
+                    # Store widgets so load/save logic can find them
                     self._widgets[col] = val_edit
                     self._zos_mode[col] = mode
                     self._zos_hint[col] = hint
 
-                    form.addRow(label + ":", roww)
+                    def refresh_hint(mode=mode, val_edit=val_edit, hint=hint) -> None:
+                        is_zone = (mode.currentData() == "zone")
+                        try:
+                            v = int((val_edit.text() or "").strip() or "0")
+                        except Exception:
+                            v = 0
+
+                        if is_zone:
+                            if v <= 0:
+                                hint.setText("Zone: (unset)")
+                                return
+                            self._load_areatable_dbc()
+                            name = self._areatable_name_by_id.get(v, "")
+                            hint.setText(f"Zone: {v} - {name}" if name else f"Zone: {v} - Unknown")
+                        else:
+                            if v <= 0:
+                                hint.setText("Sort: (unset)")
+                                return
+                            self._load_questsort_dbc()
+                            name = self._questsort_name_by_id.get(v, "")
+                            hint.setText(f"Sort: {v} - {name}" if name else f"Sort: {v} - Unknown")
+
+                    def zos_do_pick(_checked: bool = False, mode=mode, val_edit=val_edit, refresh_hint=refresh_hint) -> None:
+                        is_zone = (mode.currentData() == "zone")
+
+                        if is_zone:
+                            self._load_areatable_dbc()
+                            rows = self._areatable_cache
+                            title = "Pick Zone (AreaTable)"
+                        else:
+                            self._load_questsort_dbc()
+                            rows = self._questsort_cache
+                            title = "Pick Sort (QuestSort)"
+
+                        if not rows:
+                            QtWidgets.QMessageBox.information(self, "No data", f"No rows loaded for {title}.")
+                            return
+
+                        dlg = SimplePickerDialog(
+                            title=title,
+                            rows=rows,
+                            parent=self,
+                            initial_query=val_edit.text().strip(),
+                        )
+                        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                            chosen_id = dlg.chosen_id()
+                            if chosen_id is None:
+                                return
+                            val_edit.setText(str(int(chosen_id)))
+                            refresh_hint()
+                            self._update_dirty_title()
+
+                    # allow load() to refresh decode after setting values
+                    self._zos_refresh[col] = refresh_hint
+
+                    btn_pick.clicked.connect(zos_do_pick)
+                    mode.currentIndexChanged.connect(lambda _i, rh=refresh_hint: (rh(), self._update_dirty_title()))
+                    val_edit.textEdited.connect(lambda _t, rh=refresh_hint: (rh(), self._update_dirty_title()))
 
                     refresh_hint()
-                    continue
 
+                    # ✅ ADD row to the form (this is what makes it appear)
+                    form.addRow(label + ":", roww)
+                    continue
 
                 # -----------------------------
                 # Normal editor build continues
@@ -1259,6 +1297,101 @@ class QuestEditor(QtWidgets.QWidget):
 
         self._areatable_cache = out
         self._areatable_name_by_id = {aid: name for aid, name in out}
+    
+    def _load_questsort_dbc(self) -> None:
+        """
+        QuestSort.dbc loader (WDBC).
+        Typical layout: fields[0] = ID, fields[1] = Name string offset.
+        Produces:
+          self._questsort_cache: [(id, name), ...]
+          self._questsort_name_by_id: {id: name}
+        """
+        if getattr(self, "_questsort_cache", None):
+            return
+
+        # ---- config path checks ----
+        if config is None or not hasattr(config, "QUESTSORT_DBC"):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing config.QUESTSORT_DBC",
+                "config.py must define:\nQUESTSORT_DBC = DBC_DIR / 'QuestSort.dbc'",
+            )
+            return
+
+        dbc_path = config.QUESTSORT_DBC
+        if dbc_path is None:
+            QtWidgets.QMessageBox.warning(self, "DBC path is None", "config.QUESTSORT_DBC is None.")
+            return
+
+        dbc_path = Path(dbc_path)
+        if not dbc_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing QuestSort.dbc",
+                f"QuestSort.dbc not found at:\n{dbc_path}",
+            )
+            return
+
+        data = dbc_path.read_bytes()
+        magic4 = data[:4]
+        if magic4 != b"WDBC":
+            QtWidgets.QMessageBox.critical(
+                self,
+                "DBC Error",
+                f"Not a valid WDBC file. Magic={magic4!r}\n\nPath:\n{dbc_path}",
+            )
+            return
+
+        # ---- header ----
+        try:
+            _magic, rec_count, field_count, rec_size, str_size = struct.unpack_from("<4s4I", data, 0)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "DBC Error", f"Header parse failed: {e}")
+            return
+
+        records_off = 20
+        strings_off = records_off + rec_count * rec_size
+        string_block = data[strings_off:strings_off + str_size]
+
+        def read_cstr(off: int) -> str:
+            if off < 0 or off >= len(string_block):
+                return ""
+            end = string_block.find(b"\x00", off)
+            if end == -1:
+                return ""
+            return string_block[off:end].decode("utf-8", "ignore").strip()
+
+        ints_per_record = rec_size // 4
+        out: list[tuple[int, str]] = []
+
+        for i in range(rec_count):
+            roff = records_off + i * rec_size
+            fields = struct.unpack_from("<" + "I" * ints_per_record, data, roff)
+
+            sid = int(fields[0]) if len(fields) > 0 else 0
+            name_off = int(fields[1]) if len(fields) > 1 else 0
+            name = read_cstr(name_off) if 0 <= name_off < str_size else ""
+
+            if sid <= 0:
+                continue
+            if not name:
+                name = f"Sort {sid}"
+
+            out.append((sid, name))
+
+        out.sort(key=lambda t: t[1].lower())
+
+        if not out:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "QuestSort parse produced 0 rows",
+                f"rec_count={rec_count}, field_count={field_count}, rec_size={rec_size}, str_size={str_size}\n\nPath:\n{dbc_path}\n\n"
+                "If this is not a WDBC QuestSort.dbc or field[1] isn't the name offset, the format differs.",
+            )
+            return
+
+        self._questsort_cache = out
+        self._questsort_name_by_id = {sid: name for sid, name in out}
 
     def _pick_areatable_id_from_dbc(self) -> int | None:
         self._load_areatable_dbc()
@@ -1273,6 +1406,46 @@ class QuestEditor(QtWidgets.QWidget):
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             return dlg.chosen_id()
         return None
+    
+    def _pick_questsort_id_from_dbc(self) -> int | None:
+        self._load_questsort_dbc()
+        if not self._questsort_cache:
+            return None
+
+        dlg = SimplePickerDialog(
+            title="Pick Sort (QuestSort)",
+            rows=self._questsort_cache,
+            parent=self,
+        )
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            return dlg.chosen_id()
+        return None
+
+    def _ensure_skillline_cache_loaded(self) -> None:
+        """
+        Load SkillLine.dbc into cache without opening any dialogs.
+        This enables live decode of SkillOrClassMask when loading quests.
+        """
+        if hasattr(self, "_skillline_name_by_id") and getattr(self, "_skillline_name_by_id"):
+            return
+
+        # Needs config.SKILLLINE_DBC
+        if config is None or not hasattr(config, "SKILLLINE_DBC"):
+            return
+
+        dbc_path = Path(config.SKILLLINE_DBC)
+        if not dbc_path.exists():
+            return
+
+        try:
+            self._skillline_cache = load_skillline_dbc(str(dbc_path))
+            self._skillline_name_by_id = {
+                sid: (name or f"SkillLine {sid}") for sid, name in self._skillline_cache
+            }
+        except Exception:
+            # Don't pop errors during typing/loading; just skip decode
+            self._skillline_cache = []
+            self._skillline_name_by_id = {}
 
     def _pick_skillline_id_from_dbc(self) -> int | None:
         # Load once and cache
@@ -1308,6 +1481,35 @@ class QuestEditor(QtWidgets.QWidget):
             return dlg.chosen_id()
 
         return None
+    
+    def _refresh_zos_hint(self) -> None:
+        mode = self._zos_mode.get("ZoneOrSort")
+        hint = self._zos_hint.get("ZoneOrSort")
+        ed = self._widgets.get("ZoneOrSort")
+
+        if not mode or not hint or not ed:
+            return
+
+        is_zone = (mode.currentData() == "zone")
+
+        try:
+            val = int(ed.text().strip() or "0")
+        except Exception:
+            val = 0
+
+        if is_zone:
+            name = ""
+            if val > 0:
+                self._load_areatable_dbc()
+                name = self._areatable_name_by_id.get(val, "")
+            hint.setText(f"Zone: {val} — {name}" if name else f"Zone: {val}")
+        else:
+            sid = abs(val)
+            name = ""
+            if sid > 0:
+                self._load_questsort_dbc()
+                name = self._questsort_name_by_id.get(sid, "")
+            hint.setText(f"Sort: {sid} — {name}" if name else f"Sort: {sid}")
 
     def _create_editor(self, col: str, label: str, ftype: str) -> QtWidgets.QWidget:
         # -----------------------------
@@ -1316,7 +1518,7 @@ class QuestEditor(QtWidgets.QWidget):
         if col in ENUM_FIELDS:
             key = ENUM_FIELDS[col]
             cb = QtWidgets.QComboBox()
-            cb.setEditable(True)  # allow typing a value not in list
+            cb.setEditable(False)
             cb.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
 
             cb.addItem("", "")  # blank
@@ -1732,8 +1934,15 @@ class QuestEditor(QtWidgets.QWidget):
                     mode.setCurrentText("Skill")
                     val_edit.setText(str(raw))
 
+                # refresh live decode label
+                if hasattr(self, "_soc_refresh") and col in self._soc_refresh:
+                    try:
+                        self._soc_refresh[col]()
+                    except Exception:
+                        pass
+
                 continue
-            
+
             # --- Special decode: ZoneOrSort ---
             if col == "ZoneOrSort" and col in self._zos_mode:
                 raw = row.get(col, 0) or 0
@@ -1752,12 +1961,11 @@ class QuestEditor(QtWidgets.QWidget):
                     mode.setCurrentText("Zone")
                     val_edit.setText(str(raw))
 
-                # update hint text
-                try:
-                    # if you stored hint label, refresh by triggering textEdited logic:
-                    pass
-                except Exception:
-                    pass
+                if hasattr(self, "_zos_refresh") and col in self._zos_refresh:
+                    try:
+                        self._zos_refresh[col]()
+                    except Exception:
+                        pass
 
                 continue
 
@@ -1885,17 +2093,34 @@ class QuestEditor(QtWidgets.QWidget):
         if title:
             title_text = title.toPlainText() if hasattr(title, "toPlainText") else title.text()
 
-        r = QtWidgets.QMessageBox.warning(
+        preview = self.db.preview_delete_quest(self.current_id)
+
+        loot_lines = []
+        for table, count in preview["loot_rows_by_table"].items():
+            loot_lines.append(f"{table}: {count}")
+
+        loot_text = "\n".join(loot_lines) if loot_lines else "(none)"
+
+        msg = (
+            f"DELETE QUEST {self.current_id}?\n\n"
+            f"{title_text}\n\n"
+            "This cannot be undone.\n\n"
+            "Preview:\n"
+            f"- Condition groups: {preview['anchor_groups']}\n"
+            f"- Condition rows: {preview['conditions_rows']}\n"
+            f"- Loot rows:\n{loot_text}"
+        )
+        
+        if QtWidgets.QMessageBox.warning(
             self,
             "Delete Quest",
-            f"DELETE QUEST {self.current_id}?\n\n{title_text}\n\n"
-            "This cannot be undone.",
+            msg,
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.No,
-        )
-
-        if r != QtWidgets.QMessageBox.StandardButton.Yes:
+        ) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
+
+
 
         try:
             self.db.delete_quest(self.current_id)
@@ -1911,9 +2136,15 @@ class QuestEditor(QtWidgets.QWidget):
         self.current_id = None
         self._orig.clear()
         for w in self._widgets.values():
-            if hasattr(w, "setPlainText"):
+            if isinstance(w, QtWidgets.QPlainTextEdit):
                 w.setPlainText("")
-            else:
+            elif isinstance(w, QtWidgets.QComboBox):
+                # Clear selection safely
+                if w.count() > 0:
+                    w.setCurrentIndex(0)
+                else:
+                    w.setCurrentIndex(-1)
+            elif isinstance(w, QtWidgets.QLineEdit):
                 w.setText("")
 
         self.setWindowTitle("Quest Editor")
