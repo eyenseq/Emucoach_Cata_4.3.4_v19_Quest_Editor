@@ -60,7 +60,5 @@ Jan-15-26
 
 ### Cleanup & Maintenance
 - Removed obsolete:
-  - `loot_editor.py`
-  - `object_loot_editor.py`
-- Centralized loot logic into `GenericLootEditor`.
+- `object_loot_editor.py`
 - Reduced duplicated SQL and UI logic across editors.
