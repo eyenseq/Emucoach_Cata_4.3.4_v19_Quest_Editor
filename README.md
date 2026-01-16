@@ -39,7 +39,7 @@ Put the project folder somewhere simple, for example:
 
 ---
 
-## 3) Create a virtual environment (recommended)
+## 3) Open a command prompt
 
 Open **Command Prompt** in the project folder and run:
 
