@@ -75,10 +75,16 @@ In `config.py` (line numbers may vary slightly), you’ll see:
 ```py
 DBC_DIR = Path(r"C:\path_to_your\dbc")
 
+# Optional: per-file overrides
 SKILLLINE_DBC = DBC_DIR / "SkillLine.dbc"
 SPELL_DBC     = DBC_DIR / "Spell.dbc"
 AREATABLE_DBC = DBC_DIR / "AreaTable.dbc"
+
 QUESTSORT_DBC = DBC_DIR / "QuestSort.dbc"
+
+# Extra DBCs used by pickers
+FACTION_DBC       = DBC_DIR / "Faction.dbc"
+CURRENCYTYPES_DBC = DBC_DIR / "CurrencyTypes.dbc"
 ```
 
 ### DBC files you must have in that folder
@@ -88,6 +94,8 @@ Make sure these files exist at the path you configured:
 - `Spell.dbc`
 - `AreaTable.dbc`
 - `QuestSort.dbc`
+- `Faction.dbc`
+- `CurrencyTypes.dbc`
 
 If any are missing, the related picker/dropdown will show **“No rows loaded”** (or similar).
 
