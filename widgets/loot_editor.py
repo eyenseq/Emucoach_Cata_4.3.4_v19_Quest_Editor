@@ -1,11 +1,285 @@
 from __future__ import annotations
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+import struct
+
+try:
+    import config
+except Exception:
+    config = None
+
 
 from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from widgets.generic_loot_editor import GenericLootEditor
 
+def load_wdbc_id_name(
+    path: str,
+    *,
+    name_field_index: Optional[int] = None,
+    candidate_name_fields: Optional[List[int]] = None,
+    max_rows_scan: int = 200,
+) -> list[tuple[int, str]]:
+    """
+    Generic WDBC reader for "ID + Name" tables.
+    - ID is fields[0]
+    - Name is a string offset at some field index.
+    If name_field_index isn't provided, we guess it by scanning candidate fields.
+    """
+    data = Path(path).read_bytes()
+    if data[:4] != b"WDBC":
+        raise ValueError(f"Not a valid WDBC file. Magic={data[:4]!r}")
+
+    _magic, rec_count, field_count, rec_size, str_size = struct.unpack_from("<4s4I", data, 0)
+    records_off = 20
+    strings_off = records_off + rec_count * rec_size
+    string_block = data[strings_off : strings_off + str_size]
+
+    ints_per_record = rec_size // 4
+
+    def read_cstr(off: int) -> str:
+        if off <= 0 or off >= len(string_block):
+            return ""
+        end = string_block.find(b"\x00", off)
+        if end == -1:
+            return ""
+        return string_block[off:end].decode("utf-8", "ignore").strip()
+
+    # Choose a name field index if not provided
+    if name_field_index is None:
+        cands = candidate_name_fields or [
+            1, 2, 3, 4, 5, 6, 7, 8,
+            10, 11, 12, 13, 14,
+            20, 21, 22, 23, 24, 25, 26, 27, 28,
+        ]
+        best_idx = None
+        best_score = -1
+        scan_n = min(rec_count, max_rows_scan)
+
+        for idx in cands:
+            score = 0
+            for i in range(scan_n):
+                roff = records_off + i * rec_size
+                fields = struct.unpack_from("<" + "I" * ints_per_record, data, roff)
+                if idx >= len(fields):
+                    continue
+                s = read_cstr(int(fields[idx]))
+                if s and any(ch.isalpha() for ch in s):
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        name_field_index = best_idx if best_idx is not None else 1
+
+    out: list[tuple[int, str]] = []
+    for i in range(rec_count):
+        roff = records_off + i * rec_size
+        fields = struct.unpack_from("<" + "I" * ints_per_record, data, roff)
+        rid = int(fields[0]) if fields else 0
+        noff = int(fields[name_field_index]) if len(fields) > name_field_index else 0
+        name = read_cstr(noff) if noff else ""
+        if rid:
+            out.append((rid, name or f"ID {rid}"))
+
+    out.sort(key=lambda t: (t[1] or "").lower())
+    return out
+
+class LootIDPickerDialog(QtWidgets.QDialog):
+    """Type-as-you-type picker used by QuestLootEditor (no cross-imports).
+
+    Modes:
+      - "item" -> item_template (entry,name)
+      - "creature" -> creature_template (entry,name)
+      - "go" -> gameobject_template (entry,name)
+      - "quest" -> quest_template (Id,Title)
+    """
+
+    def __init__(self, db, mode: str, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.mode = mode
+        self._selected_id: Optional[int] = None
+
+        self.setWindowTitle(f"Pick {mode.title()} ID")
+        self.setModal(True)
+        self.resize(760, 420)
+
+        self.q = QtWidgets.QLineEdit()
+        self.q.setPlaceholderText("Type an ID or a name fragment")
+        self.btn_search = QtWidgets.QPushButton("Search")
+
+        self._live_timer = QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.timeout.connect(self.run_search)
+
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.q, 1)
+        top.addWidget(self.btn_search)
+
+        self.table = QtWidgets.QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["ID", "Name"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        self.btn_select = QtWidgets.QPushButton("Select")
+        self.btn_cancel = QtWidgets.QPushButton("Cancel")
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_select)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addWidget(self.table, 1)
+        lay.addLayout(btns)
+
+        self.btn_search.clicked.connect(self.run_search)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_select.clicked.connect(self.accept_selected)
+        self.table.cellDoubleClicked.connect(lambda _r, _c: self.accept_selected())
+        self.q.returnPressed.connect(self.run_search)
+        self.q.textChanged.connect(lambda _t: self._live_timer.start(120))
+
+        self.run_search()
+
+    def selected_id(self) -> Optional[int]:
+        return self._selected_id
+
+    def _table_and_cols(self) -> tuple[str, str, str]:
+        if self.mode == "item":
+            return ("item_template", "entry", "name")
+        if self.mode == "creature":
+            return ("creature_template", "entry", "name")
+        if self.mode == "go":
+            return ("gameobject_template", "entry", "name")
+        if self.mode == "quest":
+            return ("quest_template", "entry", "Title")
+        raise ValueError(f"Unknown mode: {self.mode}")
+
+    def run_search(self) -> None:
+        q = (self.q.text() or "").strip()
+        tbl, idcol, namecol = self._table_and_cols()
+        like = f"%{q}%"
+
+        try:
+            if q.isdigit():
+                rows = self.db.fetch_all(
+                    f"SELECT {idcol} AS id, {namecol} AS name FROM {tbl} WHERE {idcol}=%s LIMIT 200",
+                    (int(q),),
+                )
+            else:
+                rows = self.db.fetch_all(
+                    f"SELECT {idcol} AS id, {namecol} AS name FROM {tbl} WHERE {namecol} LIKE %s ORDER BY {idcol} LIMIT 200",
+                    (like,),
+                )
+        except Exception:
+            rows = []
+
+        self.table.setRowCount(0)
+        for r in rows:
+            rid = int(r.get("id") or 0)
+            nm = str(r.get("name") or "").strip()
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(rid)))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(nm))
+
+    def accept_selected(self) -> None:
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            return
+        r = sel[0].row()
+        it = self.table.item(r, 0)
+        try:
+            self._selected_id = int((it.text() or "0").strip()) if it else None
+        except Exception:
+            self._selected_id = None
+        if self._selected_id is None:
+            return
+        self.accept()
+
+class DBCIdPickerDialog(QtWidgets.QDialog):
+    """
+    Search-as-you-type picker for DBC-derived rows: [(id, name), ...]
+    """
+    def __init__(self, title: str, rows: list[tuple[int, str]], parent=None, initial_query: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self._rows = rows
+        self._chosen: Optional[int] = None
+
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Type to filter…")
+
+        self.table = QtWidgets.QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["ID", "Name"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        btn_select = QtWidgets.QPushButton("Select")
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_select.clicked.connect(self._accept_selected)
+        btn_cancel.clicked.connect(self.reject)
+
+        bb = QtWidgets.QHBoxLayout()
+        bb.addStretch(1)
+        bb.addWidget(btn_cancel)
+        bb.addWidget(btn_select)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self.search)
+        lay.addWidget(self.table, 1)
+        lay.addLayout(bb)
+
+        self.search.textChanged.connect(self._refill)
+        self.table.cellDoubleClicked.connect(lambda _r, _c: self._accept_selected())
+
+        if initial_query:
+            self.search.setText(initial_query)
+        else:
+            self._refill()
+
+    def chosen_id(self) -> Optional[int]:
+        return self._chosen
+
+    def _refill(self) -> None:
+        q = (self.search.text() or "").strip().lower()
+        if not q:
+            rows = self._rows
+        else:
+            rows = [(i, n) for (i, n) in self._rows if q in str(i) or q in (n or "").lower()]
+
+        self.table.setRowCount(0)
+        for i, n in rows[:2000]:
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(i)))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(n or ""))
+
+        if self.table.rowCount():
+            self.table.selectRow(0)
+
+    def _accept_selected(self) -> None:
+        r = self.table.currentRow()
+        if r < 0:
+            return
+        item = self.table.item(r, 0)
+        if not item:
+            return
+        try:
+            self._chosen = int(item.text())
+        except Exception:
+            self._chosen = None
+        if self._chosen is None:
+            return
+        self.accept()
 
 class QuestLootEditor(QtWidgets.QWidget):
     """
@@ -658,6 +932,8 @@ class QuestLootEditor(QtWidgets.QWidget):
         self.cond_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.cond_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         self.cond_table.itemSelectionChanged.connect(self._on_condition_selected)
+        self.cond_table.cellDoubleClicked.connect(self._on_cond_cell_double_clicked)
+
 
         self.btn_cond_reload = QtWidgets.QPushButton("Reload")
         self.btn_cond_add = QtWidgets.QPushButton("Add Condition Row")
@@ -710,6 +986,14 @@ class QuestLootEditor(QtWidgets.QWidget):
         main.addWidget(split)
 
         self._last_loot_key: Optional[tuple[int, int]] = None  # (entry,item)
+        # --- DBC picker caches (Spell/Faction/Currency) + unhandled picker tracking ---
+        self._spell_rows: list[tuple[int, str]] = []
+        self._spell_rank_by_id: dict[int, int] = {}
+
+        self._faction_rows: list[tuple[int, str]] = []
+        self._currency_rows: list[tuple[int, str]] = []
+
+        self._picker_unhandled: set[str] = set()
 
     # -------------------------
     # Public API used by app.py
@@ -746,30 +1030,40 @@ class QuestLootEditor(QtWidgets.QWidget):
 
         try:
             # Existing anchored rows for this quest (keyed by SourceType/Group/Entry)
+            quest_types = (8, 9, 14, 28, 43, 47)
+            ph = ",".join(["%s"] * len(quest_types))
+
             existing = self.db.fetch_all(
-                """
+                f"""
                 SELECT SourceTypeOrReferenceId, SourceGroup, SourceEntry
                 FROM conditions
-                WHERE ConditionTypeOrReference = %s
-                    AND ConditionValue1 = %s
-
+                WHERE ConditionTypeOrReference IN ({ph})
+                  AND (
+                        ConditionValue1 = %s
+                     OR ConditionValue2 = %s
+                     OR ConditionValue3 = %s
+                  )
                 """,
-                (self.ANCHOR_COND_TYPE, self.quest_id),
+                (*quest_types, int(self.quest_id), int(self.quest_id), int(self.quest_id)),
             )
+
             have_pairs = {
                 (int(r["SourceTypeOrReferenceId"]), int(r["SourceGroup"]), int(r["SourceEntry"]))
                 for r in existing
             }
 
-            # Next SourceId allocator (composite PK needs uniqueness)
             row = self.db.fetch_one(
-                """
+                f"""
                 SELECT COALESCE(MAX(SourceId), 0) AS m
                 FROM conditions
-                WHERE ConditionTypeOrReference = %s
-                  AND ConditionValue1 = %s
+                WHERE ConditionTypeOrReference IN ({ph})
+                  AND (
+                        ConditionValue1 = %s
+                     OR ConditionValue2 = %s
+                     OR ConditionValue3 = %s
+                  )
                 """,
-                (self.ANCHOR_COND_TYPE, self.quest_id),
+                (*quest_types, int(self.quest_id), int(self.quest_id), int(self.quest_id)),
             )
             next_source_id = int(row["m"] or 0) + 1
 
@@ -898,6 +1192,229 @@ class QuestLootEditor(QtWidgets.QWidget):
             except Exception:
                 pass
             self.log(f"Quest Loot sync failed: {type(e).__name__}: {e}")
+    
+    def _ensure_spell_rows(self) -> None:
+        if self._spell_rows:
+            return
+        if config is None or not hasattr(config, "SPELL_DBC"):
+            return
+        p = Path(getattr(config, "SPELL_DBC"))
+        if not p.exists():
+            return
+        try:
+            self._spell_rows = load_wdbc_id_name(str(p))
+        except Exception:
+            self._spell_rows = []
+
+        # Best-effort rank load from DB: spell_ranks(spell_id, rank)
+        if not self._spell_rank_by_id:
+            try:
+                rs = self.db.fetch_all("SELECT spell_id, `rank` FROM spell_ranks")
+                for r in rs:
+                    sid = int(r.get("spell_id") or 0)
+                    rk = int(r.get("rank") or 0)
+                    if sid > 0 and rk > 0:
+                        self._spell_rank_by_id[sid] = rk
+            except Exception:
+                pass
+
+    def _ensure_faction_rows(self) -> None:
+        if self._faction_rows:
+            return
+        if config is None or not hasattr(config, "FACTION_DBC"):
+            return
+        p = Path(getattr(config, "FACTION_DBC"))
+        if not p.exists():
+            return
+        try:
+            # You said: Faction.dbc name is field23
+            self._faction_rows = load_wdbc_id_name(str(p), name_field_index=23)
+        except Exception:
+            self._faction_rows = []
+
+    def _ensure_currency_rows(self) -> None:
+        if self._currency_rows:
+            return
+        if config is None or not hasattr(config, "CURRENCYTYPES_DBC"):
+            return
+        p = Path(getattr(config, "CURRENCYTYPES_DBC"))
+        if not p.exists():
+            return
+        try:
+            self._currency_rows = load_wdbc_id_name(str(p))
+        except Exception:
+            self._currency_rows = []
+
+    def _log_unhandled_picker(self, msg: str) -> None:
+        # Deduplicate + log
+        if msg in self._picker_unhandled:
+            return
+        self._picker_unhandled.add(msg)
+        self.log(f"[Picker] No handler: {msg}")
+
+    def _update_condition_display_cols(self, row: int) -> None:
+        """
+        Refresh any 'display' columns that show resolved names for the given
+        conditions row (quest name, item name, faction name, spell name, etc.)
+        after a picker changes an ID.
+        Safe no-op if the display columns aren't present.
+        """
+        try:
+            # If you already have a centralized refresh for the row, use it.
+            # Many versions use _refresh_condition_row_display(row) or similar.
+            fn = getattr(self, "_refresh_condition_row_display", None)
+            if callable(fn):
+                fn(row)
+                return
+
+            # Otherwise: do the minimal safe thing—re-run whatever you use to
+            # rebuild display columns for the whole table, if it exists.
+            fn2 = getattr(self, "_refresh_conditions_display", None)
+            if callable(fn2):
+                fn2()
+                return
+
+        except Exception:
+            pass
+
+    def _on_cond_cell_double_clicked(self, row, col_idx):
+        if col_idx >= len(self.COND_COLS):
+            return
+
+        col = self.COND_COLS[col_idx]
+
+        def cur_int(col_name: str) -> int:
+            try:
+                it = self.cond_table.item(row, self.COND_COLS.index(col_name))
+                return int((it.text() or "0").strip()) if it else 0
+            except Exception:
+                return 0
+
+        def setv(v: int) -> None:
+            it = self.cond_table.item(row, col_idx)
+            if it:
+                it.setText(str(int(v)))
+            else:
+                self.cond_table.setItem(row, col_idx, QtWidgets.QTableWidgetItem(str(int(v))))
+            self._update_condition_display_cols(row)
+
+        st = cur_int("SourceTypeOrReferenceId")
+        ct = cur_int("ConditionTypeOrReference")
+
+        # -------------------------
+        # SourceGroup picker
+        # -------------------------
+        if col == "SourceGroup":
+            # Loot-template sources: SourceGroup is the "entry" key of that loot template.
+            # For common loot templates, that entry is usually:
+            #  1 (CreatureLoot): creature_template.entry
+            #  4 (GO Loot): gameobject_template.entry
+            #  5 (Item Loot): item_template.entry
+            if st == 1:
+                dlg = LootIDPickerDialog(self.db, "creature", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            if st == 4:
+                dlg = LootIDPickerDialog(self.db, "go", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            if st == 5:
+                dlg = LootIDPickerDialog(self.db, "item", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            # For other loot templates, SourceGroup is still an "entry", but may not map cleanly
+            # to creature/go/item. We leave unhandled (as requested).
+            self._log_unhandled_picker(f"col=SourceGroup st={st} ct={ct}")
+            return
+
+        # -------------------------
+        # SourceEntry picker
+        # -------------------------
+        if col == "SourceEntry":
+            # For loot templates and most condition sources, SourceEntry is an ItemId
+            # (loot_template.item or reference_loot_template.item)
+            if st in self.LOOT_TABS:
+                dlg = LootIDPickerDialog(self.db, "item", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            # Some SourceTypes use SourceEntry differently; leave unhandled.
+            self._log_unhandled_picker(f"col=SourceEntry st={st} ct={ct}")
+            return
+
+        # -------------------------
+        # ConditionValue1 picker (based on ConditionType)
+        # -------------------------
+        if col == "ConditionValue1":
+            # Quest-related types: open quest picker
+            if ct in self.QUEST_TYPES_NEED_QUEST_ID:
+                dlg = LootIDPickerDialog(self.db, "quest", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            # Item conditions (has item / equipped): item_template.entry
+            if ct in (2, 3):
+                dlg = LootIDPickerDialog(self.db, "item", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            # Near creature / near gameobject
+            if ct == 29:
+                dlg = LootIDPickerDialog(self.db, "creature", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            if ct == 30:
+                dlg = LootIDPickerDialog(self.db, "go", self)
+                if dlg.exec() and dlg.selected_id():
+                    setv(dlg.selected_id())
+                return
+
+            # Reputation rank: faction id (Faction.dbc)
+            if ct == 5:
+                self._ensure_faction_rows()
+                if not self._faction_rows:
+                    self.log("[Picker] Faction.dbc not available; cannot open faction picker.")
+                    return
+                dlg = DBCIdPickerDialog("Pick Faction", self._faction_rows, self)
+                if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.chosen_id() is not None:
+                    setv(int(dlg.chosen_id()))
+                return
+
+            # Spell-based conditions: Spell.dbc (+ show rank if known)
+            if ct in (1, 25):
+                self._ensure_spell_rows()
+                if not self._spell_rows:
+                    self.log("[Picker] Spell.dbc not available; cannot open spell picker.")
+                    return
+
+                # decorate spell names with rank if present
+                rows = []
+                for sid, nm in self._spell_rows:
+                    rk = self._spell_rank_by_id.get(int(sid), 0)
+                    rows.append((int(sid), f"{nm}{f' (Rank {rk})' if rk else ''}"))
+
+                dlg = DBCIdPickerDialog("Pick Spell", rows, self)
+                if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.chosen_id() is not None:
+                    setv(int(dlg.chosen_id()))
+                return
+
+            # Unknown / not implemented
+            self._log_unhandled_picker(f"col=ConditionValue1 ct={ct} st={st}")
+            return
+
+        # Everything else: do nothing
+        return
 
     # -------------------------
     # Conditions
@@ -908,22 +1425,29 @@ class QuestLootEditor(QtWidgets.QWidget):
 
         # 1) Find all condition "groups" (same source key) anchored by:
         #    ConditionType=2 (Player has quest) and ConditionValue1 = quest_id
+        quest_types = (8, 9, 14, 28, 43, 47)
+        ph = ",".join(["%s"] * len(quest_types))
+
         keys = self.db.fetch_all(
-            """
+            f"""
             SELECT DISTINCT
               SourceTypeOrReferenceId, SourceGroup, SourceEntry, SourceId
             FROM conditions
-            WHERE ConditionTypeOrReference = %s
-                AND ConditionValue1 = %s
-
+            WHERE ConditionTypeOrReference IN ({ph})
+              AND (
+                    ConditionValue1 = %s
+                 OR ConditionValue2 = %s
+                 OR ConditionValue3 = %s
+              )
             """,
-            (self.ANCHOR_COND_TYPE, self.quest_id),
+            (*quest_types, int(self.quest_id), int(self.quest_id), int(self.quest_id)),
         )
+
 
         # If there are no anchor rows, show nothing (correct) but log why
         if not keys:
             self.cond_table.setRowCount(0)
-            self.log(f"Loaded 0 condition row(s) for quest {self.quest_id} (no ConditionType=9 anchor rows found).")
+            self.log(f"Loaded 0 condition row(s) for quest {self.quest_id} (no quest-related condition types found: {quest_types}).")
             return
 
         # 2) Load ALL condition rows for those keys (class/race/level/etc included)

@@ -67,6 +67,81 @@ def load_skillline_dbc(path: str) -> list[tuple[int, str]]:
             rows.append((skill_id, name))
 
     return rows
+def load_wdbc_id_name(
+    path: str,
+    *,
+    name_field_index: Optional[int] = None,
+    candidate_name_fields: Optional[List[int]] = None,
+    max_rows_scan: int = 200,
+) -> list[tuple[int, str]]:
+    """
+    Generic WDBC reader for "ID + Name" tables.
+
+    - ID is always fields[0]
+    - Name is a string offset at some field index.
+
+    If name_field_index is not provided, we try candidate_name_fields
+    (or a reasonable default set) and pick the field index that yields
+    the most non-empty printable names in the first max_rows_scan rows.
+    """
+    import struct
+
+    data = Path(path).read_bytes()
+    magic4 = data[:4]
+    if magic4 != b"WDBC":
+        raise ValueError(f"Not a valid WDBC file. Magic={magic4!r}")
+
+    _magic, rec_count, field_count, rec_size, str_size = struct.unpack_from("<4s4I", data, 0)
+    records_off = 20
+    strings_off = records_off + rec_count * rec_size
+    string_block = data[strings_off : strings_off + str_size]
+
+    ints_per_record = rec_size // 4
+
+    def read_cstr(off: int) -> str:
+        if off <= 0 or off >= len(string_block):
+            return ""
+        end = string_block.find(b"\x00", off)
+        if end == -1:
+            return ""
+        return string_block[off:end].decode("utf-8", "ignore").strip()
+
+    # Choose a name field index if not provided
+    if name_field_index is None:
+        cands = candidate_name_fields or [
+            1, 2, 3, 4, 5, 6, 7, 8,
+            10, 11, 12, 13, 14,
+            20, 21, 22, 23, 24, 25, 26, 27, 28,
+        ]
+        best_idx = None
+        best_score = -1
+        scan_n = min(rec_count, max_rows_scan)
+        for idx in cands:
+            score = 0
+            for i in range(scan_n):
+                roff = records_off + i * rec_size
+                fields = struct.unpack_from("<" + "I" * ints_per_record, data, roff)
+                if idx >= len(fields):
+                    continue
+                s = read_cstr(int(fields[idx]))
+                if s and any(ch.isalpha() for ch in s):
+                    score += 1
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        name_field_index = best_idx if best_idx is not None else 1
+
+    out: list[tuple[int, str]] = []
+    for i in range(rec_count):
+        roff = records_off + i * rec_size
+        fields = struct.unpack_from("<" + "I" * ints_per_record, data, roff)
+        rid = int(fields[0]) if fields else 0
+        noff = int(fields[name_field_index]) if len(fields) > name_field_index else 0
+        name = read_cstr(noff) if noff else ""
+        if rid:
+            out.append((rid, name or f"ID {rid}"))
+    out.sort(key=lambda t: (t[1] or "").lower())
+    return out
 
 QUEST_ID_MIN = 1000000
 QUEST_ID_MAX = 2000000
@@ -304,6 +379,28 @@ CREATURE_GO_ID_COLS = {
     "ReqCreatureOrGOId1", "ReqCreatureOrGOId2", "ReqCreatureOrGOId3", "ReqCreatureOrGOId4",
 }
 
+# Faction DBC lookups
+FACTION_ID_COLS = {
+    "RepObjectiveFaction", "RepObjectiveFaction2",
+    "RewRepFaction1", "RewRepFaction2", "RewRepFaction3", "RewRepFaction4", "RewRepFaction5",
+    "RequiredMinRepFaction", "RequiredMaxRepFaction",
+}
+
+# Spell DBC lookups (also used by Objective Builder's SpellCast)
+SPELL_ID_COLS = {
+    "SrcSpell",
+    "RequiredSpell",
+    "ReqSpellCast1", "ReqSpellCast2", "ReqSpellCast3", "ReqSpellCast4",
+    "RewSpell",
+    "RewSpellCast",
+}
+
+# CurrencyTypes DBC lookups
+CURRENCY_ID_COLS = {
+    "ReqCurrencyId1", "ReqCurrencyId2", "ReqCurrencyId3", "ReqCurrencyId4",
+    "RewCurrencyId1", "RewCurrencyId2", "RewCurrencyId3", "RewCurrencyId4",
+}
+
 def _try_int(s: str) -> Optional[int]:
     try:
         s = (s or "").strip()
@@ -322,14 +419,14 @@ class ClickableLabel(QtWidgets.QLabel):
         super().mousePressEvent(ev)
 
 
-class IDPickerDialog(QtWidgets.QDialog):
+class QuestIdPickerDialog(QtWidgets.QDialog):
     """
     Tiny ID picker for item/creature/gameobject templates.
     - Type search text (id or partial name)
     - Results list updates on Search
     - Double-click (or Select) returns chosen entry
     """
-    def __init__(self, db: Database, mode: str, parent=None):
+    def __init__(self, parent, db, mode, initial_query: str = ""):
         super().__init__(parent)
         self.db = db
         self.mode = mode  # "item" | "creature" | "go"
@@ -340,8 +437,18 @@ class IDPickerDialog(QtWidgets.QDialog):
         self.resize(720, 420)
 
         self.q = QtWidgets.QLineEdit()
+        if initial_query:
+            self.q.setText(initial_query)
+            self.q.selectAll()
+
+
         self.q.setPlaceholderText("Type an ID (e.g. 6948) or a name fragment (e.g. hearth)")
         self.btn_search = QtWidgets.QPushButton("Search")
+
+        # Live-search debounce (keeps DB queries reasonable)
+        self._live_timer = QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.timeout.connect(self.run_search)
 
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.q, 1)
@@ -372,8 +479,9 @@ class IDPickerDialog(QtWidgets.QDialog):
         self.btn_select.clicked.connect(self.accept_selected)
         self.table.cellDoubleClicked.connect(lambda _r, _c: self.accept_selected())
 
-        # Enter triggers search
+        # Enter triggers immediate search; typing triggers debounced search
         self.q.returnPressed.connect(self.run_search)
+        self.q.textChanged.connect(lambda _t: self._live_timer.start(120))
 
     def selected_id(self) -> Optional[int]:
         return self._selected_id
@@ -391,7 +499,6 @@ class IDPickerDialog(QtWidgets.QDialog):
         text = (self.q.text() or "").strip()
         tbl = self._table_name()
 
-        # If numeric, do exact ID lookup first (fast)
         rows = []
         try:
             qid = int(text)
@@ -607,17 +714,29 @@ class QuestRelationPanel(QtWidgets.QWidget):
         grid.addWidget(self.sec_go_start[0],  0, 1)
         grid.addWidget(self.sec_go_end[0],    1, 1)
 
+    def _update_dirty_title(self) -> None:
+        """
+        QuestRelationPanel doesn't own the window title/dirty state.
+        Bubble up to the parent widget that implements _update_dirty_title().
+        """
+        p = self.parent()
+        while p is not None:
+            fn = getattr(p, "_update_dirty_title", None)
+            if callable(fn):
+                fn()
+                return
+            p = p.parent()
+
     def _pick_into(self, mode: str, target: QtWidgets.QLineEdit) -> None:
-        # reuse your existing IDPickerDialog
-        dlg = IDPickerDialog(self.db, mode, self)
         cur = (target.text() or "").strip()
-        if cur:
-            dlg.q.setText(cur)
-        dlg.run_search()
+
+        dlg = QuestIdPickerDialog(self, self.db, mode, initial_query=cur)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            picked = dlg.selected_id()
+            picked = dlg.chosen_id()
             if picked is not None:
-                target.setText(str(picked))
+                target.setText(str(int(picked)))
+                self._update_dirty_title()
+
     
 
     def load(self, quest_id: int) -> None:
@@ -823,6 +942,16 @@ class QuestEditor(QtWidgets.QWidget):
         self._item_name_cache: Dict[int, str] = {}
         self._cre_name_cache: Dict[int, str] = {}
         self._go_name_cache: Dict[int, str] = {}
+        self._faction_cache: list[tuple[int, str]] = []
+        self._faction_name_by_id: dict[int, str] = {}
+
+        self._currency_cache: list[tuple[int, str]] = []
+        self._currency_name_by_id: dict[int, str] = {}
+
+        self._spell_cache: list[tuple[int, str]] = []
+        self._spell_name_by_id: dict[int, str] = {}
+        self._spell_rank_by_id: dict[int, int] = {}
+
         self._bitmask_labels: Dict[str, QtWidgets.QLabel] = {}
         self._areatable_cache: List[Tuple[int, str]] = []
         self._areatable_name_by_id: Dict[int, str] = {}
@@ -1123,6 +1252,57 @@ class QuestEditor(QtWidgets.QWidget):
                 # Normal editor build continues
                 # -----------------------------
                 editor = self._create_editor(col, label, ftype)
+                # -------------------------------------------------
+                # Case C: ID picker fields (Item / Creature/GO / Faction / Spell / Currency)
+                # Adds:
+                #   [ editor ] [ Pick… ]   inline name label under it
+                # and wires "search as you type" via debounce.
+                # -------------------------------------------------
+                if col in (ITEM_ID_COLS | CREATURE_GO_ID_COLS | FACTION_ID_COLS | SPELL_ID_COLS | CURRENCY_ID_COLS):
+                    # Always wrap ID fields with Pick… + inline name
+                    roww = QtWidgets.QWidget()
+                    v = QtWidgets.QVBoxLayout(roww)
+                    v.setContentsMargins(0, 0, 0, 0)
+                    v.setSpacing(4)
+
+                    top = QtWidgets.QHBoxLayout()
+                    top.setContentsMargins(0, 0, 0, 0)
+
+                    btn = QtWidgets.QPushButton("Pick…")
+                    btn.setFixedWidth(70)
+
+                    top.addWidget(editor, 1)
+                    top.addWidget(btn)
+                    v.addLayout(top)
+
+                    name_lbl = ClickableLabel("—")
+                    name_lbl.setStyleSheet("color:#9aa4ad; font-size: 11px;")
+                    v.addWidget(name_lbl)
+
+                    # register label for inline lookups
+                    self._name_labels[col] = name_lbl
+
+                    # Pick button -> picker dialog
+                    btn.clicked.connect(lambda _=None, c=col: self._open_id_picker(c))
+
+                    # Search-as-you-type (debounced lookup)
+                    if hasattr(editor, "textChanged"):
+                        editor.textChanged.connect(lambda _t, c=col: self._schedule_lookup(c))
+                    elif hasattr(editor, "textEdited"):
+                        editor.textEdited.connect(lambda _t, c=col: self._schedule_lookup(c))
+
+                    # Clicking the inline label also opens picker (nice QoL)
+                    name_lbl.clicked.connect(lambda c=col: self._open_id_picker(c))
+
+                    form.addRow(label, roww)
+
+                    # store editor widget reference so save/load still works
+                    self._widgets[col] = editor
+
+                    # trigger initial label fill if it has a value
+                    self._schedule_lookup(col)
+                    continue
+
                 # -----------------------------------
                 # Objectives field with Builder button
                 # -----------------------------------
@@ -1298,6 +1478,68 @@ class QuestEditor(QtWidgets.QWidget):
         self._areatable_cache = out
         self._areatable_name_by_id = {aid: name for aid, name in out}
     
+    def _ensure_faction_cache_loaded(self) -> None:
+        if self._faction_name_by_id:
+            return
+        if config is None or not hasattr(config, "FACTION_DBC"):
+            return
+        dbc_path = Path(getattr(config, "FACTION_DBC"))
+        if not dbc_path.exists():
+            return
+        try:
+            # You reported: id field + field23 is name
+            rows = load_wdbc_id_name(str(dbc_path), name_field_index=23)
+            self._faction_cache = rows
+            self._faction_name_by_id = {i: n for i, n in rows}
+        except Exception:
+            self._faction_cache = []
+            self._faction_name_by_id = {}
+
+    def _ensure_currency_cache_loaded(self) -> None:
+        if self._currency_name_by_id:
+            return
+        if config is None or not hasattr(config, "CURRENCYTYPES_DBC"):
+            return
+        dbc_path = Path(getattr(config, "CURRENCYTYPES_DBC"))
+        if not dbc_path.exists():
+            return
+        try:
+            rows = load_wdbc_id_name(str(dbc_path))  # auto-detect name field
+            self._currency_cache = rows
+            self._currency_name_by_id = {i: n for i, n in rows}
+        except Exception:
+            self._currency_cache = []
+            self._currency_name_by_id = {}
+
+    def _ensure_spell_cache_loaded(self) -> None:
+        # Load spell names once (Spell.dbc), but ALWAYS try to load ranks from DB.
+        if not self._spell_name_by_id:
+            if config is None or not hasattr(config, "SPELL_DBC"):
+                return
+            dbc_path = Path(getattr(config, "SPELL_DBC"))
+            if not dbc_path.exists():
+                return
+            try:
+                rows = load_wdbc_id_name(str(dbc_path))  # auto-detect name field
+                self._spell_cache = rows
+                self._spell_name_by_id = {i: n for i, n in rows}
+            except Exception:
+                self._spell_cache = []
+                self._spell_name_by_id = {}
+
+        # Best-effort load spell ranks from DB table "spell_ranks" (spell_id, rank)
+        if not self._spell_rank_by_id:
+            try:
+                rs = self.db.fetch_all("SELECT spell_id, `rank` FROM spell_ranks")
+                for r in rs:
+                    sid = int(r.get("spell_id") or 0)
+                    rk = int(r.get("rank") or 0)
+                    # Keep your existing rule (only store real ranks)
+                    if sid > 0 and rk > 0:
+                        self._spell_rank_by_id[sid] = rk
+            except Exception:
+                pass
+
     def _load_questsort_dbc(self) -> None:
         """
         QuestSort.dbc loader (WDBC).
@@ -1528,6 +1770,17 @@ class QuestEditor(QtWidgets.QWidget):
             cb.currentTextChanged.connect(lambda _t: self._update_dirty_title())
             return cb
 
+        # ------------------------------------------------------------
+        # FORCE ID FIELDS TO QLineEdit so they can use Pick... + inline
+        # ------------------------------------------------------------
+        if col in (ITEM_ID_COLS | CREATURE_GO_ID_COLS | FACTION_ID_COLS | SPELL_ID_COLS | CURRENCY_ID_COLS):
+            w = QtWidgets.QLineEdit()
+            w.setPlaceholderText(label)
+            w.textEdited.connect(self._update_dirty_title)
+            w.setObjectName(col)
+            return w
+
+        # Normal editors
         if ftype == "text" or col in TEXT_COLS:
             w = QtWidgets.QPlainTextEdit()
             w.setTabChangesFocus(True)
@@ -1687,44 +1940,107 @@ class QuestEditor(QtWidgets.QWidget):
         lbl.setText(self._decode_mask(col, v))
 
     def _open_id_picker(self, col: str) -> None:
-        # Decide picker type based on column
-        if col in ITEM_ID_COLS:
-            dlg = IDPickerDialog(self.db, "item", self)
-            dlg.q.setText(_get_widget_text(self._widgets[col]))
-            dlg.run_search()
-            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                picked = dlg.selected_id()
-                if picked is not None:
-                    self._widgets[col].setText(str(picked))
-                    self._update_inline_name(col)
-                    self._update_dirty_title()
+        w = self._widgets.get(col)
+        if not w:
             return
 
-        if col in CREATURE_GO_ID_COLS:
-            # Tiny choice dialog: Creature vs GO
-            m = QtWidgets.QMessageBox(self)
-            m.setWindowTitle("Pick Type")
-            m.setText("Search which template?")
-            btn_cre = m.addButton("Creature", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-            btn_go = m.addButton("GameObject", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-            m.addButton("Cancel", QtWidgets.QMessageBox.ButtonRole.RejectRole)
-            m.exec()
+        cur = _get_widget_text(w).strip()
 
-            clicked = m.clickedButton()
-            if clicked not in (btn_cre, btn_go):
+        # ---------- Items ----------
+        if col in ITEM_ID_COLS:
+            import inspect
+            print("DEBUG QuestIdPickerDialog file:", inspect.getsourcefile(QuestIdPickerDialog))
+            print("DEBUG QuestIdPickerDialog sig :", inspect.signature(QuestIdPickerDialog.__init__))
+
+            dlg = QuestIdPickerDialog(self, self.db, "item", initial_query=cur)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                cid = dlg.chosen_id()
+                if cid is not None:
+                    _set_widget_text(w, str(int(cid)))
+                    self._schedule_lookup(col)
+            return
+
+        # ---------- Creature / GO ----------
+        if col in CREATURE_GO_ID_COLS:
+            # ReqCreatureOrGOId#: user chooses whether this is an NPC (positive)
+            # or a GameObject (negative). We store:
+            #   NPC: +creature_template.entry
+            #   GO : -gameobject_template.entry
+            try:
+                v = int(cur) if cur else 0
+            except Exception:
+                v = 0
+
+            # Ask user which picker they want (default based on current sign)
+            mb = QtWidgets.QMessageBox(self)
+            mb.setWindowTitle("Pick Requirement Type")
+            mb.setText("Pick what this requirement ID refers to:")
+            btn_npc = mb.addButton("NPC (Creature)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            btn_go  = mb.addButton("GameObject (GO)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            mb.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+
+            # Default highlight based on current value sign
+            mb.setDefaultButton(btn_go if v < 0 else btn_npc)
+
+            mb.exec()
+            clicked = mb.clickedButton()
+            if clicked not in (btn_npc, btn_go):
                 return
 
-            mode = "creature" if clicked == btn_cre else "go"
-            dlg = IDPickerDialog(self.db, mode, self)
-            dlg.q.setText(_get_widget_text(self._widgets[col]))
-            dlg.run_search()
+            mode = "creature" if clicked == btn_npc else "gameobject"
+
+            dlg = QuestIdPickerDialog(self, self.db, mode, initial_query=str(abs(v)) if v else "")
             if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-                picked = dlg.selected_id()
-                if picked is not None:
-                    self._widgets[col].setText(str(picked))
-                    self._update_inline_name(col)
-                    self._update_dirty_title()
+                cid = dlg.chosen_id()
+                if cid is not None:
+                    picked = int(cid)
+                    if mode == "gameobject":
+                        picked = -abs(picked)   # GO must be negative
+                    else:
+                        picked = abs(picked)    # NPC must be positive
+                    _set_widget_text(w, str(picked))
+                    self._schedule_lookup(col)
             return
+        # ---------- Factions ----------
+        if col in FACTION_ID_COLS:
+            self._ensure_faction_cache_loaded()
+            rows = sorted(self._faction_cache or [], key=lambda x: x[0])
+            dlg = SimplePickerDialog("Pick Faction", rows, self, initial_query=cur)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                cid = dlg.chosen_id()
+                if cid is not None:
+                    _set_widget_text(w, str(int(cid)))
+                    self._schedule_lookup(col)
+            return
+
+        # ---------- Spells (with rank) ----------
+        if col in SPELL_ID_COLS:
+            self._ensure_spell_cache_loaded()
+            rows = []
+            for sid, nm in (self._spell_cache or []):
+                rk = self._spell_rank_by_id.get(int(sid), 0)
+                rows.append((int(sid), f"{nm}{f' (Rank {rk})' if rk else ''}"))
+            dlg = SimplePickerDialog("Pick Spell", rows, self, initial_query=cur)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                cid = dlg.chosen_id()
+                if cid is not None:
+                    _set_widget_text(w, str(int(cid)))
+                    self._schedule_lookup(col)
+            return
+
+        # ---------- Currency ----------
+        if col in CURRENCY_ID_COLS:
+            self._ensure_currency_cache_loaded()
+            rows = sorted(self._currency_cache or [], key=lambda x: x[0])
+            dlg = SimplePickerDialog("Pick Currency", rows, self, initial_query=cur)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                cid = dlg.chosen_id()
+                if cid is not None:
+                    _set_widget_text(w, str(int(cid)))
+                    self._schedule_lookup(col)
+            return
+
+        self.log(f"[Picker] No handler: col={col}")
 
     def _run_pending_lookups(self) -> None:
         pending = list(self._lookup_pending)
@@ -1816,32 +2132,64 @@ class QuestEditor(QtWidgets.QWidget):
         if not w:
             return
 
-        # We only attach inline name labels to ID line edits
         raw = _get_widget_text(w).strip()
         n = _try_int(raw)
 
-        if not n or n <= 0:
+        if n is None or n == 0:
             self._set_inline_label(col, "—")
             return
 
         if col in ITEM_ID_COLS:
-            name = self._lookup_item_name(n)
+            name = self._lookup_item_name(abs(n))
             self._set_inline_label(col, name if name else "(not found)")
             return
 
         if col in CREATURE_GO_ID_COLS:
-            cname = self._lookup_creature_name(n)
+            # +id = creature_template.entry, -id = gameobject_template.entry
+            if n > 0:
+                cname = self._lookup_creature_name(n)
+                if cname:
+                    self._set_inline_label(col, f"Creature: {cname}")
+                    return
+            if n < 0:
+                gname = self._lookup_go_name(abs(n))
+                if gname:
+                    self._set_inline_label(col, f"GO: {gname}")
+                    return
+            # Fall back: try both as positive, for legacy data
+            cname = self._lookup_creature_name(abs(n))
             if cname:
                 self._set_inline_label(col, f"Creature: {cname}")
                 return
-            gname = self._lookup_go_name(n)
+            gname = self._lookup_go_name(abs(n))
             if gname:
                 self._set_inline_label(col, f"GO: {gname}")
                 return
             self._set_inline_label(col, "(not found)")
             return
 
-        # Default fallback (shouldn't happen if wired correctly)
+        if col in FACTION_ID_COLS:
+            self._ensure_faction_cache_loaded()
+            nm = self._faction_name_by_id.get(abs(n), "")
+            self._set_inline_label(col, nm if nm else "(not found)")
+            return
+
+        if col in CURRENCY_ID_COLS:
+            self._ensure_currency_cache_loaded()
+            nm = self._currency_name_by_id.get(abs(n), "")
+            self._set_inline_label(col, nm if nm else "(not found)")
+            return
+
+        if col in SPELL_ID_COLS:
+            self._ensure_spell_cache_loaded()
+            nm = self._spell_name_by_id.get(abs(n), "")
+            rk = self._spell_rank_by_id.get(abs(n), 0)
+            if nm:
+                self._set_inline_label(col, f"{nm}{f' (Rank {rk})' if rk else ''}")
+            else:
+                self._set_inline_label(col, "(not found)")
+            return
+
         self._set_inline_label(col, "")
 
     def _open_objective_builder(self) -> None:
@@ -2323,12 +2671,12 @@ def _render_reward_lines(d: dict, lookup=None):
 
     return choice, guaranteed
 
-class IdPickerDialog(QtWidgets.QDialog):
+class QuestIdPickerDialog(QtWidgets.QDialog):
     """
     Tiny searchable ID picker (single-file friendly).
     Supports: items, creatures, gameobjects.
     """
-    def __init__(self, parent, db, kind: str):
+    def __init__(self, parent, db, kind: str, initial_query: str = ""):
         super().__init__(parent)
         self.db = db
         self.kind = kind
@@ -2343,6 +2691,9 @@ class IdPickerDialog(QtWidgets.QDialog):
 
         self.btn = QtWidgets.QPushButton("Search")
         self.btn.clicked.connect(self._run)
+        if initial_query:
+            self.search.setText(initial_query)
+            self.search.selectAll()
 
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.search, 1)
@@ -2436,6 +2787,10 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.db = db
         self.initial = initial
+        self._spell_rows: list[tuple[int, str]] = []
+        self._spell_name_by_id: dict[int, str] = {}
+        self._spell_rank_by_id: dict[int, int] = {}
+
         self.setWindowTitle("Objective Builder")
         self.resize(920, 560)
 
@@ -2510,13 +2865,52 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
             # connect picker per row
             def make_pick(row_idx: int):
                 def _pick():
-                    t = self.rows[row_idx]["type"].currentText()
+                    r = self.rows[row_idx]
+                    t = r["type"].currentText()
+                    id_edit = r["id"]
+                    cnt = r["count"]
+
                     if t == "Item":
-                        dlg = IdPickerDialog(self, self.db, "item")
+                        dlg = QuestIdPickerDialog(self, self.db, "item")
                     elif t == "Creature":
-                        dlg = IdPickerDialog(self, self.db, "creature")
+                        dlg = QuestIdPickerDialog(self, self.db, "creature")
                     elif t == "GameObject":
-                        dlg = IdPickerDialog(self, self.db, "gameobject")
+                        dlg = QuestIdPickerDialog(self, self.db, "gameobject")
+                    elif t == "SpellCast":
+
+                        # Spell.dbc picker + rank (spell_ranks table)
+                        self._ensure_spells_loaded()
+
+                        if not self._spell_rows:
+                            QtWidgets.QMessageBox.warning(
+                                self,
+                                "Spell.dbc not loaded",
+                                "Could not load Spell.dbc. Check config.SPELL_DBC.",
+                            )
+                            return
+
+                        rows = []
+                        for sid, nm in self._spell_rows:
+                            rk = self._spell_rank_by_id.get(int(sid), 0)
+                            rows.append((int(sid), f"{nm}{f' (Rank {rk})' if rk else ''}"))
+
+                        dlg = SimplePickerDialog("Pick Spell", rows, self, initial_query=(id_edit.text() or "").strip())
+                        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                            picked = dlg.chosen_id()
+                            if picked is not None:
+                                id_edit.setText(str(int(picked)))
+                                # SpellCast count doesn’t really matter; keep it sane
+                                if cnt.value() <= 0:
+                                    cnt.setValue(1)
+                                # update label + objective text + preview
+                                try:
+                                    r["name"].setText(self._lookup_name("SpellCast", int(picked)) or "—")
+                                except Exception:
+                                    pass
+                                self._autofill_objective_text(row_idx)
+                                self._refresh_preview()
+                        return
+
                     else:
                         return
 
@@ -2570,6 +2964,31 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
 
         self._load_from_initial()
         self._refresh_preview()
+
+    def _ensure_spells_loaded(self) -> None:
+        # Load Spell.dbc names once, but ALWAYS try to load ranks too.
+        if not self._spell_name_by_id:
+            try:
+                import config
+                dbc_path = Path(getattr(config, "SPELL_DBC"))
+                rows = load_wdbc_id_name(str(dbc_path))  # auto-detect name field
+            except Exception:
+                rows = []
+
+            self._spell_rows = rows
+            self._spell_name_by_id = {i: n for i, n in rows}
+
+        # Load spell ranks from DB table "spell_ranks" (spell_id, rank)
+        if not self._spell_rank_by_id:
+            try:
+                rs = self.db.fetch_all("SELECT spell_id, `rank` FROM spell_ranks")
+                for r in rs:
+                    sid = int(r.get("spell_id") or 0)
+                    rk = int(r.get("rank") or 0)
+                    if sid > 0 and rk > 0:
+                        self._spell_rank_by_id[sid] = rk
+            except Exception:
+                pass
 
     def _load_from_initial(self):
         # Seed ObjectiveText lines
@@ -2673,8 +3092,14 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
                 return (row.get("name") or "").strip() if row else ""
 
             if typ == "SpellCast":
-                # Optional: if you later add spell lookup tables, hook here.
-                return f"Spell {rid}"
+                self._ensure_spells_loaded()
+                nm = self._spell_name_by_id.get(int(rid), "")
+                rk = self._spell_rank_by_id.get(int(rid), 0)
+                if nm:
+                    return f"{nm}{f' (Rank {rk})' if rk else ''}"
+                return ""
+            
+            
 
         except Exception:
             # Don't crash the builder if lookup fails
@@ -2693,7 +3118,7 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
 
         # Resolve display name when possible
         nm = ""
-        if typ in ("Item", "Creature", "GameObject"):
+        if typ in ("Item", "Creature", "GameObject", "SpellCast"):
             nm = self._lookup_name(typ, rid)
             if not nm or nm == "—":
                 nm = ""
@@ -2789,8 +3214,7 @@ class ObjectiveBuilderDialog(QtWidgets.QDialog):
                     out[f"ReqItemId{item_slot}"] = str(max(0, n))
                     out[f"ReqItemCount{item_slot}"] = str(max(0, cnt))
                     item_slot += 1
-            elif typ == "SpellCast":
-                out[f"ReqSpellCast{slot}"] = str(max(0, n))
+            
 
         # Build the big Objectives text from ObjectiveText lines
         lines = []
