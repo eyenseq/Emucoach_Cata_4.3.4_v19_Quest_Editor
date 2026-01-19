@@ -65,6 +65,6 @@ Jan-15-26
 
 Jan-19-26
 
-#New features
+# New features
 - Conditions SourceEntry, SourceGroup, and ConditionValue1 can now be double clicked to bring up appropriate search **NOTE: not all *_loot_templates can be mapped back to quest_template. They are special case conditions**
 - Most id fields have the appropriate search/pick button
